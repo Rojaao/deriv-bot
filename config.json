@@ -1,0 +1,1 @@
+{ "stake": 0.35, "martingale": true, "factor": 1.65, "profit_limit": 10, "loss_limit": 10 }
