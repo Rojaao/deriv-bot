@@ -1,124 +1,136 @@
+
 import streamlit as st
 import websocket
-import threading
 import json
+import threading
 import time
 
-st.set_page_config(page_title="Deriv Bot - Estratégia 6em7Digit", layout="centered")
-
-tick_history = []
-loss_streak = 0
-profit = 0.0
-loss = 0.0
-running = False
+# Variáveis globais
 ws = None
+connected = False
+running = False
+loss_count = 0
+profit = 0.0
+loss_limit = 10
+profit_limit = 10
+martingale = True
+factor = 1.65
+initial_stake = 0.35
+current_stake = initial_stake
+ticks = []
 
-def alert_sound(win=True):
-    sound = "✅ Operação com lucro!" if win else "❌ Operação com prejuízo!"
-    st.toast(sound)
-
-def send_buy_contract(token, symbol, stake, contract_type):
-    global ws
-    if not ws: return
-    data = {
-        "buy": 1,
-        "price": stake,
-        "parameters": {
-            "amount": stake,
-            "basis": "stake",
-            "contract_type": contract_type,
-            "currency": "USD",
-            "duration": 1,
-            "duration_unit": "t",
-            "symbol": symbol
-        }
-    }
-    ws.send(json.dumps(data))
+# Função de análise 6em7Digit
+def analyze_ticks_and_trade():
+    global running, ws, current_stake, loss_count, profit
+    if len(ticks) >= 8:
+        últimos = ticks[-8:]
+        abaixo_de_4 = [d for d in últimos if d < 4]
+        if len(abaixo_de_4) >= 6:
+            contract = {
+                "buy": 1,
+                "price": round(current_stake, 2),
+                "parameters": {
+                    "amount": round(current_stake, 2),
+                    "basis": "stake",
+                    "contract_type": "DIGITOVER",
+                    "currency": "USD",
+                    "duration": 1,
+                    "duration_unit": "t",
+                    "symbol": "R_10",
+                    "barrier": "3"
+                },
+                "passthrough": {},
+                "req_id": 1
+            }
+            ws.send(json.dumps(contract))
 
 def on_message(wsapp, message):
-    global tick_history, running, loss_streak, profit, loss
+    global connected, running, ticks, profit, loss_count, current_stake
     data = json.loads(message)
+    if "msg_type" in data:
+        if data["msg_type"] == "authorize":
+            connected = True
+        elif data["msg_type"] == "tick":
+            digit = int(str(data["tick"]["quote"])[-1])
+            ticks.append(digit)
+            if len(ticks) > 100:
+                ticks.pop(0)
+            if running:
+                analyze_ticks_and_trade()
+        elif data["msg_type"] == "buy":
+            st.session_state.log.append(f"🎯 Ordem enviada: Digit Over 3 com stake ${current_stake}")
+        elif data["msg_type"] == "proposal_open_contract":
+            if data["proposal_open_contract"]["is_sold"]:
+                pnl = data["proposal_open_contract"]["profit"]
+                profit += pnl
+                if pnl > 0:
+                    st.session_state.log.append(f"✅ Ganhou ${pnl:.2f}")
+                    current_stake = initial_stake
+                    loss_count = 0
+                else:
+                    st.session_state.log.append(f"❌ Perdeu ${abs(pnl):.2f}")
+                    loss_count += 1
+                    if martingale:
+                        current_stake *= factor
+                if profit >= profit_limit:
+                    st.session_state.log.append("🏁 Limite de lucro atingido. Robô parado.")
+                    stop_bot()
+                elif abs(profit) >= loss_limit:
+                    st.session_state.log.append("🛑 Limite de perda atingido. Robô parado.")
+                    stop_bot()
 
-    if 'tick' in data:
-        tick = int(str(data['tick']['quote'])[-1])
-        tick_history.append(tick)
-        if len(tick_history) > selected_analysis:
-            tick_history.pop(0)
-        if running:
-            analyze_and_trade()
+def on_open(wsapp):
+    wsapp.send(json.dumps({"authorize": st.session_state.token}))
+    wsapp.send(json.dumps({"ticks": "R_10", "subscribe": 1}))
 
-    if 'buy' in data:
-        st.session_state.log.append(f"🎯 Ordem enviada: ID {data['buy']['buy_id']}")
+def on_close(wsapp, close_status_code, close_msg):
+    global connected
+    connected = False
 
-    if 'proposal_open_contract' in data:
-        if data['proposal_open_contract']['is_sold']:
-            result = data['proposal_open_contract']['profit']
-            if result > 0:
-                st.session_state.log.append("✅ Lucro: $" + str(round(result, 2)))
-                profit += result
-                loss_streak = 0
-                alert_sound(True)
-            else:
-                st.session_state.log.append("❌ Prejuízo: $" + str(round(result, 2)))
-                loss += abs(result)
-                loss_streak += 1
-                alert_sound(False)
-
-def analyze_and_trade():
-    global tick_history, ws, running, stake, loss_streak, profit, loss
-
-    if len(tick_history) < 8: return
-    small_digits = [d for d in tick_history[-8:] if d < 4]
-    if len(small_digits) >= 6 and loss_streak < 4:
-        send_buy_contract(token, symbol, stake, "DIGITOVER")
-        st.session_state.log.append(f"📈 Entrada com DIGITOVER 3 (Stake: ${stake})")
-
-def run_bot():
-    global ws, running
-    running = True
-    ws = websocket.WebSocketApp(
-        "wss://ws.derivws.com/websockets/v3",
-        on_message=on_message
-    )
-    ws.on_open = lambda ws: ws.send(json.dumps({"authorize": token}))
+def run_ws():
+    global ws
+    ws = websocket.WebSocketApp("wss://ws.derivws.com/websockets/v3",
+                                on_message=on_message,
+                                on_open=on_open,
+                                on_close=on_close)
     ws.run_forever()
 
+def start_bot():
+    global running, current_stake, loss_count, profit
+    running = True
+    current_stake = initial_stake
+    loss_count = 0
+    profit = 0.0
+    st.session_state.log.append("🤖 Robô iniciado")
+
 def stop_bot():
-    global ws, running
+    global running
     running = False
-    if ws:
-        try:
-            ws.close()
-        except:
-            pass
+    st.session_state.log.append("⛔ Robô parado")
 
+# Interface
 st.title("🤖 Deriv Bot - Estratégia 6em7Digit")
-
-token = st.text_input("Token da Deriv", type="password")
-symbol = st.selectbox("Símbolo", ["R_10", "R_25", "R_50", "R_75", "R_100"], index=0)
-stake = st.number_input("Stake Inicial", value=0.35)
-martingale = st.checkbox("Ativar Martingale", value=True)
-factor = st.number_input("Fator Martingale", value=1.65)
-profit_limit = st.number_input("Limite de Lucro ($)", value=10.0)
-loss_limit = st.number_input("Limite de Perda ($)", value=10.0)
-selected_analysis = st.selectbox("Analisar últimos dígitos", [10, 33, 50, 100], index=1)
+st.markdown("Conecte-se com seu token Deriv para iniciar.")
 
 if "log" not in st.session_state:
     st.session_state.log = []
 
-col1, col2 = st.columns(2)
-
-if col1.button("▶️ Iniciar Robô"):
-    threading.Thread(target=run_bot).start()
-    st.success("Robô iniciado!")
-
-if col2.button("⏹ Parar Robô"):
-    stop_bot()
-    st.warning("Robô parado.")
-
-st.subheader("📋 Registro de Operações")
-for item in st.session_state.log[-20:]:
-    st.write(item)
-
-st.markdown("---")
-st.caption("Desenvolvido para uso em conta real ou demo na Deriv.com via WebSocket")
+st.session_state.token = st.text_input("🔑 Token da API Deriv", type="password")
+if st.session_state.token:
+    if not connected:
+        threading.Thread(target=run_ws).start()
+        time.sleep(2)
+    st.success("✅ Conectado à Deriv" if connected else "❌ Não conectado")
+    st.markdown("---")
+    st.markdown("### 🎯 Estratégia ativa: 6em7Digit (Digit Over 3 com base nos últimos 8 ticks)")
+    st.write(f"📈 Stake inicial: ${initial_stake} | 🎲 Martingale: {'Sim' if martingale else 'Não'}")
+    st.write(f"💰 Limite de lucro: ${profit_limit} | 📉 Limite de perda: ${loss_limit}")
+    if st.button("▶️ Iniciar Robô"):
+        start_bot()
+    if st.button("⏹ Parar Robô"):
+        stop_bot()
+    st.markdown("### 📊 Relatório ao vivo:")
+    for log in st.session_state.log[-15:][::-1]:
+        st.write(log)
+else:
+    st.warning("Insira seu token da API para iniciar.")
