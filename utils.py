@@ -1,1 +1,1 @@
-# utils.py - Funções auxiliares (análise de ticks, martingale, logs)
+# Funções auxiliares para análise e histórico
